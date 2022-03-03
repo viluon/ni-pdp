@@ -35,49 +35,100 @@ vector<vector<u32>> load_input() {
     return graph;
 }
 
-u32 cut_weight(const vector<vector<u32>>& graph, const vector<bool>& assignment) {
-    const u32 a = 10;
-    u32 w = 0;
-    u32 n_set = 0;
-    for (u32 i = 0; i < graph.size(); i++) {
-        n_set += assignment[i];
-        for (u32 j = 0; j < i; j++) {
-            if (assignment[i] != assignment[j]) {
-                w += graph[i][j];
+struct Sln {
+    const vector<vector<u32>>& graph;
+    vector<bool> assignment;
+    u32 weight;
+    u32 n_set;
+
+    explicit Sln(const vector<vector<u32>>& graph)
+    : graph(graph)
+    , assignment(graph.size(), false)
+    , weight(0)
+    , n_set(0)
+    {}
+
+    Sln(const Sln& other)
+    : graph(other.graph)
+    , assignment(other.assignment)
+    , weight(other.weight)
+    , n_set(other.n_set)
+    {}
+
+    Sln(Sln&& other)
+    : graph(other.graph)
+    , assignment(move(other.assignment))
+    , weight(other.weight)
+    , n_set(other.n_set)
+    {}
+
+    Sln& operator=(const Sln& other) {
+        assignment = other.assignment;
+        weight = other.weight;
+        n_set = other.n_set;
+        return *this;
+    }
+
+    Sln& operator=(Sln&& other) {
+        assignment = move(other.assignment);
+        weight = other.weight;
+        n_set = other.n_set;
+        return *this;
+    }
+
+    Sln include(u32 node) const { return this->update(node, true); }
+    Sln exclude(u32 node) const { return this->update(node, false); }
+
+    Sln update(u32 node, bool included) const {
+        Sln result = *this;
+        result.n_set += included - assignment[node];
+        result.assignment[node] = included;
+
+        for (u32 i = 0; i < node; i++) {
+            if (result.assignment[node] != result.assignment[i]) {
+                result.weight += graph[node][i];
             }
         }
+        return result;
     }
 
-    if ((n_set == a) || (n_set == graph.size() - a)) {
-        return w;
+    bool valid(u32 a) const {
+        return (n_set == a) || (n_set == graph.size() - a);
     }
-    return (u32)-1;
+};
+
+Sln pick(u32 a, const Sln& sln_x, const Sln& sln_y) {
+    if (!sln_x.valid(a)) {
+        return sln_y;
+    }
+    return (!sln_y.valid(a) || sln_x.weight < sln_y.weight) ? sln_x : sln_y;
 }
 
-vector<bool> solve(const vector<vector<u32>>& graph, const vector<bool>& assignment, u32 node) {
-    if (node > graph.size()) {
-        return assignment;
-    }
+Sln solve(u32 a, const vector<vector<u32>>& graph, const Sln& sln, const Sln& best, u32 node) {
+    if (false
+    || (node >= graph.size())
+    || (min(sln.n_set, graph.size() - sln.n_set) > a)
+    || (best.valid(a) && sln.weight > best.weight)
+    ) { return sln; }
 
-    auto included = assignment;
-    included[node] = true;
-    auto excluded = assignment;
-    excluded[node] = false;
-
-    auto inc_sln = solve(graph, included, node + 1);
-    auto exc_sln = solve(graph, excluded, node + 1);
-
-    if (cut_weight(graph, inc_sln) < cut_weight(graph, exc_sln)) {
-        return inc_sln;
-    }
-    return exc_sln;
+    const auto incl_sln = solve(a, graph, sln.include(node), best, node + 1);
+    const auto new_best = pick(a, incl_sln, best);
+    const auto excl_sln = solve(a, graph, sln.exclude(node), new_best, node + 1);
+    return pick(a, excl_sln, new_best);
 }
 
 int main() {
     auto graph = load_input();
-
-    auto sln = solve(graph, vector<bool>(graph.size(), false), 0);
-    cout << cut_weight(graph, sln) << endl;
+    u32 a = 15;
+    auto init = Sln(graph);
+    auto sln = solve(a, graph, init, init, 0);
+    cout << sln.weight << " (" << sln.n_set << ")" << endl;
+    for (u32 i = 0; i < graph.size(); i++) {
+        if (sln.assignment[i]) {
+            cout << sln.assignment[i] << " ";
+        }
+    }
+    cout << endl;
 
     return 0;
 }
