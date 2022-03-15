@@ -92,12 +92,29 @@ struct Sln {
         return result;
     }
 
+    u32 lower_bound(u32 node) const {
+        u32 result = this->weight;
+        for (u32 i = node; i < graph.size(); i++) {
+            u32 included = 0;
+            u32 excluded = 0;
+            for (u32 j = 0; j < graph.size(); j++) {
+                if (assignment[j]) {
+                    included += graph[i][j];
+                } else {
+                    excluded += graph[i][j];
+                }
+            }
+            result += min(included, excluded);
+        }
+        return result;
+    }
+
     bool valid(u32 a) const {
         return (n_set == a) || (n_set == graph.size() - a);
     }
 };
 
-Sln pick(u32 a, const Sln& sln_x, const Sln& sln_y) {
+const Sln& pick(u32 a, const Sln& sln_x, const Sln& sln_y) {
     if (!sln_x.valid(a)) {
         return sln_y;
     }
@@ -119,7 +136,7 @@ Sln solve(u32 a, const vector<vector<u32>>& graph, const Sln& sln, const Sln& be
 
 int main() {
     auto graph = load_input();
-    u32 a = 15;
+    u32 a = 10;
     auto init = Sln(graph);
     auto sln = solve(a, graph, init, init, 0);
     cout << sln.weight << " (" << sln.n_set << ")" << endl;
