@@ -38,12 +38,14 @@ vector<vector<u32>> load_input() {
 struct Sln {
     const vector<vector<u32>>& graph;
     vector<bool> assignment;
+    bool valid;
     u32 weight;
     u32 n_set;
 
     explicit Sln(const vector<vector<u32>>& graph)
     : graph(graph)
     , assignment(graph.size(), false)
+    , valid(false)
     , weight(0)
     , n_set(0)
     {}
@@ -51,6 +53,7 @@ struct Sln {
     Sln(const Sln& other)
     : graph(other.graph)
     , assignment(other.assignment)
+    , valid(other.valid)
     , weight(other.weight)
     , n_set(other.n_set)
     {}
@@ -58,12 +61,14 @@ struct Sln {
     Sln(Sln&& other)
     : graph(other.graph)
     , assignment(move(other.assignment))
+    , valid(other.valid)
     , weight(other.weight)
     , n_set(other.n_set)
     {}
 
     Sln& operator=(const Sln& other) {
         assignment = other.assignment;
+        valid = other.valid;
         weight = other.weight;
         n_set = other.n_set;
         return *this;
@@ -71,6 +76,7 @@ struct Sln {
 
     Sln& operator=(Sln&& other) {
         assignment = move(other.assignment);
+        valid = other.valid;
         weight = other.weight;
         n_set = other.n_set;
         return *this;
@@ -92,12 +98,20 @@ struct Sln {
         return result;
     }
 
+    // relies on invariants:
+    // - the assignment vector is decomposable into an assigned prefix and an unassigned suffix
+    // - the about-to-be-assigned node is passed as the sole argument
+    // - the graph matrix is symmetric (the graph is undirected)
+    // [ 0 1 2 3 4 5 6 7 8 9 ]
+    // [ 1 0 1 0 0 0 0 0 0 0 ]
+    //    node ^
     u32 lower_bound(u32 node) const {
         u32 result = this->weight;
         for (u32 i = node; i < graph.size(); i++) {
             u32 included = 0;
             u32 excluded = 0;
-            for (u32 j = 0; j < graph.size(); j++) {
+
+            for (u32 j = 0; j < node; j++) {
                 if (assignment[j]) {
                     included += graph[i][j];
                 } else {
@@ -106,39 +120,68 @@ struct Sln {
             }
             result += min(included, excluded);
         }
-        return result;
-    }
 
-    bool valid(u32 a) const {
-        return (n_set == a) || (n_set == graph.size() - a);
+        return result;
     }
 };
 
-const Sln& pick(u32 a, const Sln& sln_x, const Sln& sln_y) {
-    if (!sln_x.valid(a)) {
+const Sln& pick(const Sln& sln_x, const Sln& sln_y) {
+    if (!sln_x.valid) {
         return sln_y;
     }
-    return (!sln_y.valid(a) || sln_x.weight < sln_y.weight) ? sln_x : sln_y;
+    return (!sln_y.valid || sln_x.weight < sln_y.weight) ? sln_x : sln_y;
 }
 
-void solve(Sln* result, u32 a, const vector<vector<u32>>& graph, const Sln& sln, const Sln& best, u32 node) {
+Sln optimum = Sln(vector<vector<u32>>());
+
+void solve(u16 depth, Sln* result, u32 a, const vector<vector<u32>>& graph, const Sln& sln, Sln best, u32 node) {
+    #pragma omp critical
+    {
+        best = pick(best, optimum);
+    }
     if (false
     || (node >= graph.size())
     || (min(sln.n_set, graph.size() - sln.n_set) > a)
-    || (best.valid(a) && sln.weight > best.weight)
-    ) { *result = sln; return; }
+    || (best.valid && sln.weight > best.weight)
+    || (best.valid && sln.lower_bound(node) > best.weight)
+    ) {
+        *result = sln;
+        if (node >= graph.size()) {
+            result->valid = (result->n_set == a) || (result->n_set == graph.size() - a);
+        }
+        return;
+    }
 
     Sln incl_sln = best;
-    #pragma omp task shared(graph, sln, best, node, incl_sln)
-    solve(&incl_sln, a, graph, sln.include(node), best, node + 1);
-    // const auto new_best = pick(a, incl_sln, best);
-
     Sln excl_sln = best;
-    #pragma omp task shared(graph, sln, best, node, excl_sln)
-    solve(&excl_sln, a, graph, sln.exclude(node), best /*new_best*/, node + 1);
-    #pragma omp taskwait
-    *result = pick(a, excl_sln, pick(a, incl_sln, best) /*new_best*/);
-    return;
+
+    if (depth < 3) {
+        #pragma omp task shared(graph, sln, best, node, incl_sln) firstprivate(depth, a)
+        solve(depth + 1, &incl_sln, a, graph, sln.include(node), best, node + 1);
+
+        #pragma omp task shared(graph, sln, best, node, excl_sln) firstprivate(depth, a)
+        solve(depth + 1, &excl_sln, a, graph, sln.exclude(node), best, node + 1);
+
+        #pragma omp taskwait
+        *result = pick(excl_sln, pick(incl_sln, best));
+        #pragma omp critical
+        {
+            if (result->valid && result->weight < optimum.weight) {
+                optimum = *result;
+            }
+        }
+    } else {
+        solve(depth + 1, &incl_sln, a, graph, sln.include(node), best, node + 1);
+        const auto new_best = pick(incl_sln, best);
+        solve(depth + 1, &excl_sln, a, graph, sln.exclude(node), new_best, node + 1);
+        *result = pick(excl_sln, new_best);
+        #pragma omp critical
+        {
+            if (result->valid && result->weight < optimum.weight) {
+                optimum = *result;
+            }
+        }
+    }
 }
 
 int main() {
@@ -147,16 +190,14 @@ int main() {
     auto sln = init;
     #pragma omp parallel num_threads(4)
     {
-        u32 a = 10;
+        u32 a = 15;
         #pragma omp single
-        solve(&sln, a, graph, init, init, 0);
+        solve(0, &sln, a, graph, init, init, 0);
     }
 
     cout << sln.weight << " (" << sln.n_set << ")" << endl;
     for (u32 i = 0; i < graph.size(); i++) {
-        if (sln.assignment[i]) {
-            cout << sln.assignment[i] << " ";
-        }
+        cout << sln.assignment[i] << " ";
     }
     cout << endl;
 
