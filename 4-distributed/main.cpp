@@ -1,5 +1,6 @@
 #include <boost/mpi/environment.hpp>
 #include <boost/mpi/communicator.hpp>
+#include <boost/serialization/vector.hpp>
 #include <cstdint>
 #include <vector>
 #include <iostream>
@@ -21,6 +22,8 @@ typedef  int_fast8_t   i8;
 
 using namespace std;
 
+auto dummy = vector<vector<u32>>();
+constexpr u32 a = 10;
 
 vector<vector<u32>> load_input() {
     vector<vector<u32>> graph;
@@ -41,21 +44,22 @@ vector<vector<u32>> load_input() {
     return graph;
 }
 
-// TODO: use Boost MPI for serialization of C++ objects
 struct Sln {
-    const vector<vector<u32>>& graph;
+    vector<vector<u32>>& graph;
     vector<bool> assignment;
     bool valid;
     u32 weight;
     u32 n_set;
 
-    explicit Sln(const vector<vector<u32>>& graph)
+    explicit Sln(vector<vector<u32>>& graph)
     : graph(graph)
     , assignment(graph.size(), false)
     , valid(false)
     , weight(0)
     , n_set(0)
     {}
+
+    explicit Sln() : Sln(dummy) {}
 
     Sln(const Sln& other)
     : graph(other.graph)
@@ -130,7 +134,20 @@ struct Sln {
 
         return result;
     }
+private:
+    friend class boost::serialization::access;
+
+    template<class Archive>
+    void serialize(Archive & ar, const unsigned int __attribute__((__unused__)) version)
+    {
+        ar & assignment;
+        ar & valid;
+        ar & weight;
+        ar & n_set;
+    }
 };
+
+Sln optimum = Sln(dummy);
 
 const Sln& pick(const Sln& sln_x, const Sln& sln_y) {
     if (!sln_x.valid) {
@@ -138,8 +155,6 @@ const Sln& pick(const Sln& sln_x, const Sln& sln_y) {
     }
     return (!sln_y.valid || sln_x.weight < sln_y.weight) ? sln_x : sln_y;
 }
-
-Sln optimum = Sln(vector<vector<u32>>());
 
 void solve(Sln* result, u32 a, const vector<vector<u32>>& graph, const Sln& sln, Sln best, u32 node) {
     #pragma omp critical
@@ -174,7 +189,7 @@ void solve(Sln* result, u32 a, const vector<vector<u32>>& graph, const Sln& sln,
     }
 }
 
-deque<pair<u16, Sln>> gen_initial_configurations(const vector<vector<u32>>& graph) {
+deque<pair<u16, Sln>> gen_initial_configurations(vector<vector<u32>>& graph) {
     constexpr u8 p = 4;
     constexpr u8 z = 15; // found optimal with Hyperfine
     auto q = deque<pair<u16, Sln>>();
@@ -200,7 +215,7 @@ deque<pair<u16, Sln>> gen_initial_configurations(const vector<vector<u32>>& grap
     return q;
 }
 
-void solve(u32 a, const vector<vector<u32>>& graph) {
+void solve(u32 a, vector<vector<u32>>& graph) {
     // generate a queue of configurations
     // each thread will process one of these configurations
     auto queue = gen_initial_configurations(graph);
@@ -213,40 +228,130 @@ void solve(u32 a, const vector<vector<u32>>& graph) {
     }
 }
 
+constexpr u32 TAG_WORK_NODE_VECTOR = 0xbeef;
+constexpr u32 TAG_WORK_SLN_VECTOR = 0xbecca;
+constexpr u32 TAG_TERMINATE = 0xdead;
+constexpr u32 TAG_GRAPH = 0xface;
+constexpr u32 TAG_DONE = 0xcafe;
+// 64 configurations at a time to each slave
+constexpr u32 batch_size = 64;
+
+// invariant: only called when the queue is non-empty
+pair<mpi::request, mpi::request> send_configurations(mpi::communicator& world, i32 dest, deque<pair<u16, Sln>>& queue) {
+    auto batch = make_pair(vector<u16>(), vector<Sln>());
+    for (u32 i = 0; i < batch_size; i++) {
+        if (queue.empty()) {
+            break;
+        }
+        batch.first.emplace_back(queue.front().first);
+        batch.second.emplace_back(queue.front().second);
+        queue.pop_front();
+    }
+    return make_pair(
+        world.isend(dest, TAG_WORK_NODE_VECTOR, batch.first),
+        world.isend(dest, TAG_WORK_SLN_VECTOR, batch.second)
+    );
+}
+
+deque<pair<u16, Sln>> init_slaves(mpi::communicator& world, vector<vector<u32>>& graph) {
+    auto queue = gen_initial_configurations(graph);
+    vector<mpi::request> requests;
+    requests.reserve(3 * world.size());
+    for (i32 dest = 1; dest < world.size(); dest++) {
+        // send the graph and the initial configurations to the workers
+        requests.emplace_back(world.isend(dest, TAG_GRAPH, graph));
+        auto p = send_configurations(world, dest, queue);
+        requests.emplace_back(p.first);
+        requests.emplace_back(p.second);
+    }
+    return queue;
+}
+
 void master(mpi::communicator& world) {
     auto graph = load_input();
-    u32 a = 10;
-    solve(a, graph);
+    auto queue = init_slaves(world, graph);
 
-    auto sln = Sln(graph);
-    #pragma omp critical
-    {
-        sln = optimum;
+    Sln best = Sln(graph);
+    u32 working_slaves = world.size() - 1;
+    while (working_slaves > 0) {
+        // listen for TAG_DONE from a slave
+        Sln sln = best;
+        auto status = world.recv(mpi::any_source, TAG_DONE, sln);
+        if (queue.empty()) {
+            // all work is done, terminate the slave
+            world.send(status.source(), TAG_TERMINATE);
+            working_slaves--;
+        } else {
+            // send the next batch of configurations to the slave
+            send_configurations(world, status.source(), queue);
+        }
+        best = pick(best, sln);
     }
 
-    cout << sln.weight << " (" << sln.n_set << ")" << endl;
+    cout << best.weight << " (" << best.n_set << ")" << endl;
     for (u32 i = 0; i < graph.size(); i++) {
-        cout << sln.assignment[i] << " ";
+        cout << best.assignment[i] << " ";
     }
     cout << endl;
 }
 
 void slave(mpi::communicator& world) {
-    // TODO
+    // receive the graph
+    vector<vector<u32>> graph;
+    world.recv(0, TAG_GRAPH, graph);
+
+    while (true) {
+        cout << "slave " << world.rank() << ": waiting for work" << endl;
+        vector<u16> node_vector;
+        vector<Sln> sln_vector;
+
+        // listen for TAG_WORK_NODE_VECTOR, TAG_WORK_SLN_VECTOR, and TAG_TERMINATE
+        // asynchronously. Only move on if both NODE_VECTOR and SLN_VECTOR are received, or
+        // if only TAG_TERMINATE is received.
+        mpi::request reqs[] = {
+            world.irecv(0, TAG_TERMINATE),
+            world.irecv(0, TAG_WORK_NODE_VECTOR, node_vector),
+            world.irecv(0, TAG_WORK_SLN_VECTOR, sln_vector)
+        };
+        auto [status, req_ptr] = mpi::wait_any(reqs, reqs + 3);
+
+        if (req_ptr == &reqs[0]) {
+            cout << "slave " << world.rank() << ": terminating" << endl;
+            reqs[1].cancel();
+            reqs[2].cancel();
+            break;
+        } else {
+            cout << "slave " << world.rank() << ": waiting for the remaining vector" << endl;
+            mpi::wait_all(reqs + 1, reqs + 3);
+            reqs[0].cancel();
+        }
+
+        // process the batch
+        #pragma omp parallel for schedule(dynamic)
+        for (u32 i = 0; i < node_vector.size(); i++) {
+            auto node = node_vector[i];
+            auto sln = sln_vector[i];
+            // FIXME shitty semantics lead to a copy
+            sln.graph = graph;
+            Sln result(sln); // we read the actual result from the optimum
+            solve(&result, a, graph, sln, sln, node);
+        }
+
+        // send TAG_DONE to the master
+        world.send(0, TAG_DONE, optimum);
+    }
 }
 
 int main() {
     mpi::environment env;
     mpi::communicator world;
-    cout
-        << "I am process " << world.rank()
-        << " of " << world.size()
-        << "." << endl;
 
     if (world.rank() == 0) {
         master(world);
+        cout << "master " << world.rank() << " finished" << endl;
     } else {
         slave(world);
+        cout << "slave " << world.rank() << " finished" << endl;
     }
 
     return 0;
