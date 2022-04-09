@@ -37,6 +37,7 @@ vector<vector<u32>> load_input() {
     return graph;
 }
 
+// TODO: use Boost MPI for serialization of C++ objects
 struct Sln {
     const vector<vector<u32>>& graph;
     vector<bool> assignment;
@@ -171,7 +172,7 @@ void solve(Sln* result, u32 a, const vector<vector<u32>>& graph, const Sln& sln,
 
 deque<pair<u16, Sln>> gen_initial_configurations(const vector<vector<u32>>& graph) {
     constexpr u8 p = 4;
-    constexpr u8 z = 2;
+    constexpr u8 z = 15; // found optimal with Hyperfine
     auto q = deque<pair<u16, Sln>>();
     q.emplace_back(make_pair(0, Sln(graph)));
 
@@ -210,7 +211,7 @@ void solve(u32 a, const vector<vector<u32>>& graph) {
 
 int main() {
     auto graph = load_input();
-    u32 a = 15;
+    u32 a = 10;
     solve(a, graph);
 
     auto sln = Sln(graph);
