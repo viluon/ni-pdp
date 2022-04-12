@@ -23,7 +23,7 @@ typedef  int_fast8_t   i8;
 using namespace std;
 
 auto dummy = vector<vector<u32>>();
-constexpr u32 a = 10;
+constexpr u32 a = 15;
 
 vector<vector<u32>> load_input() {
     vector<vector<u32>> graph;
@@ -45,25 +45,28 @@ vector<vector<u32>> load_input() {
 }
 
 struct Sln {
-    vector<vector<u32>>& graph;
+    vector<vector<u32>>* graph;
     vector<bool> assignment;
+    u32 lower_bound;
     bool valid;
     u32 weight;
     u32 n_set;
 
-    explicit Sln(vector<vector<u32>>& graph)
+    explicit Sln(vector<vector<u32>>* graph)
     : graph(graph)
-    , assignment(graph.size(), false)
+    , assignment(graph->size(), false)
+    , lower_bound(0)
     , valid(false)
     , weight(0)
     , n_set(0)
     {}
 
-    explicit Sln() : Sln(dummy) {}
+    explicit Sln() : Sln(&dummy) {}
 
     Sln(const Sln& other)
     : graph(other.graph)
     , assignment(other.assignment)
+    , lower_bound(other.lower_bound)
     , valid(other.valid)
     , weight(other.weight)
     , n_set(other.n_set)
@@ -72,13 +75,16 @@ struct Sln {
     Sln(Sln&& other)
     : graph(other.graph)
     , assignment(move(other.assignment))
+    , lower_bound(other.lower_bound)
     , valid(other.valid)
     , weight(other.weight)
     , n_set(other.n_set)
     {}
 
     Sln& operator=(const Sln& other) {
+        graph = other.graph;
         assignment = other.assignment;
+        lower_bound = other.lower_bound;
         valid = other.valid;
         weight = other.weight;
         n_set = other.n_set;
@@ -86,7 +92,9 @@ struct Sln {
     }
 
     Sln& operator=(Sln&& other) {
+        graph = other.graph;
         assignment = move(other.assignment);
+        lower_bound = other.lower_bound;
         valid = other.valid;
         weight = other.weight;
         n_set = other.n_set;
@@ -97,6 +105,7 @@ struct Sln {
     Sln exclude(u32 node) const { return this->update(node, false); }
 
     Sln update(u32 node, bool included) const {
+        const auto& graph = *(this->graph);
         Sln result = *this;
         result.n_set += included - assignment[node];
         result.assignment[node] = included;
@@ -106,6 +115,10 @@ struct Sln {
                 result.weight += graph[node][i];
             }
         }
+
+        result.lower_bound += result.weight;
+        result.lower_bound -= this->weight;
+        result.update_lower_bound(node);
         return result;
     }
 
@@ -116,7 +129,9 @@ struct Sln {
     // [ 0 1 2 3 4 5 6 7 8 9 ]
     // [ 1 0 1 0 0 0 0 0 0 0 ]
     //    node ^
-    u32 lower_bound(u32 node) const {
+    u32 compute_lower_bound(u32 node) const {
+        //cppcheck-suppress shadowVariable
+        const auto& graph = *(this->graph);
         u32 result = this->weight;
         for (u32 i = node; i < graph.size(); i++) {
             u32 included = 0;
@@ -134,6 +149,26 @@ struct Sln {
 
         return result;
     }
+
+    // perform only one iteration of the above algorithm
+    // for incremental updates
+    void update_lower_bound(u32 node) {
+        // TODO ensure that it's called with node + 1
+        //cppcheck-suppress shadowVariable
+        const auto& graph = *(this->graph);
+        u32 included = 0;
+        u32 excluded = 0;
+
+        for (u32 j = 0; j < node; j++) {
+            if (assignment[j]) {
+                included += graph[node][j];
+            } else {
+                excluded += graph[node][j];
+            }
+        }
+
+        lower_bound += min(included, excluded);
+    }
 private:
     friend class boost::serialization::access;
 
@@ -141,13 +176,14 @@ private:
     void serialize(Archive & ar, const unsigned int __attribute__((__unused__)) version)
     {
         ar & assignment;
+        ar & lower_bound;
         ar & valid;
         ar & weight;
         ar & n_set;
     }
 };
 
-Sln optimum = Sln(dummy);
+Sln optimum = Sln(&dummy);
 
 const Sln& pick(const Sln& sln_x, const Sln& sln_y) {
     if (!sln_x.valid) {
@@ -165,7 +201,7 @@ void solve(Sln* result, u32 a, const vector<vector<u32>>& graph, const Sln& sln,
     || (node >= graph.size())
     || (min(sln.n_set, graph.size() - sln.n_set) > a)
     || (best.valid && sln.weight > best.weight)
-    || (best.valid && sln.lower_bound(node) > best.weight)
+    || (best.valid && sln.compute_lower_bound(node) > best.weight)
     ) {
         *result = sln;
         if (node >= graph.size()) {
@@ -193,7 +229,7 @@ deque<pair<u16, Sln>> gen_initial_configurations(vector<vector<u32>>& graph) {
     constexpr u8 p = 4;
     constexpr u8 z = 15; // found optimal with Hyperfine
     auto q = deque<pair<u16, Sln>>();
-    q.emplace_back(make_pair(0, Sln(graph)));
+    q.emplace_back(make_pair(0, Sln(&graph)));
 
     while (q.size() < z * p) {
         auto pair = q.front();
@@ -213,19 +249,6 @@ deque<pair<u16, Sln>> gen_initial_configurations(vector<vector<u32>>& graph) {
     // }
 
     return q;
-}
-
-void solve(u32 a, vector<vector<u32>>& graph) {
-    // generate a queue of configurations
-    // each thread will process one of these configurations
-    auto queue = gen_initial_configurations(graph);
-
-    #pragma omp parallel for schedule(dynamic)
-    for (auto pair : queue) {
-        auto node = pair.first;
-        auto sln = pair.second;
-        solve(&sln, a, graph, sln, sln, node);
-    }
 }
 
 constexpr u32 TAG_WORK_NODE_VECTOR = 0xbeef;
@@ -271,7 +294,7 @@ void master(mpi::communicator& world) {
     auto graph = load_input();
     auto queue = init_slaves(world, graph);
 
-    Sln best = Sln(graph);
+    Sln best = Sln(&graph);
     u32 working_slaves = world.size() - 1;
     while (working_slaves > 0) {
         // listen for TAG_DONE from a slave
@@ -295,6 +318,30 @@ void master(mpi::communicator& world) {
     cout << endl;
 }
 
+// Listen for TAG_WORK_NODE_VECTOR, TAG_WORK_SLN_VECTOR, and TAG_TERMINATE
+// asynchronously. Only move on if both NODE_VECTOR and SLN_VECTOR are received, or
+// if only TAG_TERMINATE is received.
+bool wait_for_work(mpi::communicator& world, vector<u16>& node_vector, vector<Sln>& sln_vector) {
+    mpi::request reqs[] = {
+        world.irecv(0, TAG_TERMINATE),
+        world.irecv(0, TAG_WORK_NODE_VECTOR, node_vector),
+        world.irecv(0, TAG_WORK_SLN_VECTOR, sln_vector)
+    };
+    auto [status, req_ptr] = mpi::wait_any(reqs, reqs + 3);
+
+    if (req_ptr == &reqs[0]) {
+        cout << "slave " << world.rank() << ": terminating" << endl;
+        reqs[1].cancel();
+        reqs[2].cancel();
+        return false;
+    } else {
+        cout << "slave " << world.rank() << ": waiting for the remaining vector" << endl;
+        mpi::wait_all(reqs + 1, reqs + 3);
+        reqs[0].cancel();
+        return true;
+    }
+}
+
 void slave(mpi::communicator& world) {
     // receive the graph
     vector<vector<u32>> graph;
@@ -305,25 +352,8 @@ void slave(mpi::communicator& world) {
         vector<u16> node_vector;
         vector<Sln> sln_vector;
 
-        // listen for TAG_WORK_NODE_VECTOR, TAG_WORK_SLN_VECTOR, and TAG_TERMINATE
-        // asynchronously. Only move on if both NODE_VECTOR and SLN_VECTOR are received, or
-        // if only TAG_TERMINATE is received.
-        mpi::request reqs[] = {
-            world.irecv(0, TAG_TERMINATE),
-            world.irecv(0, TAG_WORK_NODE_VECTOR, node_vector),
-            world.irecv(0, TAG_WORK_SLN_VECTOR, sln_vector)
-        };
-        auto [status, req_ptr] = mpi::wait_any(reqs, reqs + 3);
-
-        if (req_ptr == &reqs[0]) {
-            cout << "slave " << world.rank() << ": terminating" << endl;
-            reqs[1].cancel();
-            reqs[2].cancel();
+        if (!wait_for_work(world, node_vector, sln_vector)) {
             break;
-        } else {
-            cout << "slave " << world.rank() << ": waiting for the remaining vector" << endl;
-            mpi::wait_all(reqs + 1, reqs + 3);
-            reqs[0].cancel();
         }
 
         // process the batch
@@ -331,8 +361,7 @@ void slave(mpi::communicator& world) {
         for (u32 i = 0; i < node_vector.size(); i++) {
             auto node = node_vector[i];
             auto sln = sln_vector[i];
-            // FIXME shitty semantics lead to a copy
-            sln.graph = graph;
+            sln.graph = &graph;
             Sln result(sln); // we read the actual result from the optimum
             solve(&result, a, graph, sln, sln, node);
         }
