@@ -46,7 +46,7 @@ vector<vector<u32>> load_input() {
 
 struct Sln {
     vector<vector<u32>>* graph;
-    vector<bool> assignment;
+    vector<u8> assignment;
     u32 lower_bound;
     bool valid;
     u32 weight;
@@ -105,6 +105,7 @@ struct Sln {
     Sln exclude(u32 node) const { return this->update(node, false); }
 
     Sln update(u32 node, bool included) const {
+        //cppcheck-suppress shadowVariable
         const auto& graph = *(this->graph);
         Sln result = *this;
         result.n_set += included - assignment[node];
@@ -292,6 +293,7 @@ deque<pair<u16, Sln>> init_slaves(mpi::communicator& world, vector<vector<u32>>&
 
 void master(mpi::communicator& world) {
     auto graph = load_input();
+    cout << "loaded graph of n = " << graph.size() << endl;
     auto queue = init_slaves(world, graph);
 
     Sln best = Sln(&graph);
@@ -306,14 +308,16 @@ void master(mpi::communicator& world) {
             working_slaves--;
         } else {
             // send the next batch of configurations to the slave
-            send_configurations(world, status.source(), queue);
+            auto p = send_configurations(world, status.source(), queue);
+            mpi::request reqs[2] = {p.first, p.second};
+            mpi::wait_all(reqs, reqs + 2);
         }
         best = pick(best, sln);
     }
 
     cout << best.weight << " (" << best.n_set << ")" << endl;
     for (u32 i = 0; i < graph.size(); i++) {
-        cout << best.assignment[i] << " ";
+        cout << (u32)best.assignment[i] << " ";
     }
     cout << endl;
 }
