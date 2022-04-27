@@ -252,29 +252,39 @@ deque<pair<u16, Sln>> gen_initial_configurations(vector<vector<u32>>& graph) {
     return q;
 }
 
-constexpr u32 TAG_WORK_NODE_VECTOR = 0xbeef;
-constexpr u32 TAG_WORK_SLN_VECTOR = 0xbecca;
 constexpr u32 TAG_TERMINATE = 0xdead;
 constexpr u32 TAG_GRAPH = 0xface;
+constexpr u32 TAG_WORK = 0xbeef;
 constexpr u32 TAG_DONE = 0xcafe;
 // 64 configurations at a time to each slave
 constexpr u32 batch_size = 64;
 
+struct WorkData {
+    vector<u16> node_ids;
+    vector<Sln> configs;
+private:
+    friend class boost::serialization::access;
+
+    template<class Archive>
+    void serialize(Archive & ar, const unsigned int __attribute__((__unused__)) version)
+    {
+        ar & node_ids;
+        ar & configs;
+    }
+};
+
 // invariant: only called when the queue is non-empty
-pair<mpi::request, mpi::request> send_configurations(mpi::communicator& world, i32 dest, deque<pair<u16, Sln>>& queue) {
-    auto batch = make_pair(vector<u16>(), vector<Sln>());
+mpi::request send_configurations(mpi::communicator& world, i32 dest, deque<pair<u16, Sln>>& queue) {
+    WorkData batch;
     for (u32 i = 0; i < batch_size; i++) {
         if (queue.empty()) {
             break;
         }
-        batch.first.emplace_back(queue.front().first);
-        batch.second.emplace_back(queue.front().second);
+        batch.node_ids.emplace_back(queue.front().first);
+        batch.configs.emplace_back(queue.front().second);
         queue.pop_front();
     }
-    return make_pair(
-        world.isend(dest, TAG_WORK_NODE_VECTOR, batch.first),
-        world.isend(dest, TAG_WORK_SLN_VECTOR, batch.second)
-    );
+    return world.isend(dest, TAG_WORK, batch);
 }
 
 deque<pair<u16, Sln>> init_slaves(mpi::communicator& world, vector<vector<u32>>& graph) {
@@ -284,10 +294,10 @@ deque<pair<u16, Sln>> init_slaves(mpi::communicator& world, vector<vector<u32>>&
     for (i32 dest = 1; dest < world.size(); dest++) {
         // send the graph and the initial configurations to the workers
         requests.emplace_back(world.isend(dest, TAG_GRAPH, graph));
-        auto p = send_configurations(world, dest, queue);
-        requests.emplace_back(p.first);
-        requests.emplace_back(p.second);
+        requests.emplace_back(send_configurations(world, dest, queue));
     }
+    // wait for all the data to send
+    mpi::wait_all(requests.begin(), requests.end());
     return queue;
 }
 
@@ -308,9 +318,7 @@ void master(mpi::communicator& world) {
             working_slaves--;
         } else {
             // send the next batch of configurations to the slave
-            auto p = send_configurations(world, status.source(), queue);
-            mpi::request reqs[2] = {p.first, p.second};
-            mpi::wait_all(reqs, reqs + 2);
+            send_configurations(world, status.source(), queue).wait();
         }
         best = pick(best, sln);
     }
@@ -325,22 +333,19 @@ void master(mpi::communicator& world) {
 // Listen for TAG_WORK_NODE_VECTOR, TAG_WORK_SLN_VECTOR, and TAG_TERMINATE
 // asynchronously. Only move on if both NODE_VECTOR and SLN_VECTOR are received, or
 // if only TAG_TERMINATE is received.
-bool wait_for_work(mpi::communicator& world, vector<u16>& node_vector, vector<Sln>& sln_vector) {
+bool wait_for_work(mpi::communicator& world, WorkData& work) {
     mpi::request reqs[] = {
         world.irecv(0, TAG_TERMINATE),
-        world.irecv(0, TAG_WORK_NODE_VECTOR, node_vector),
-        world.irecv(0, TAG_WORK_SLN_VECTOR, sln_vector)
+        world.irecv(0, TAG_WORK, work),
     };
-    auto [status, req_ptr] = mpi::wait_any(reqs, reqs + 3);
+    auto [status, req_ptr] = mpi::wait_any(reqs, reqs + 2);
 
     if (req_ptr == &reqs[0]) {
         cout << "slave " << world.rank() << ": terminating" << endl;
         reqs[1].cancel();
-        reqs[2].cancel();
         return false;
     } else {
-        cout << "slave " << world.rank() << ": waiting for the remaining vector" << endl;
-        mpi::wait_all(reqs + 1, reqs + 3);
+        cout << "slave " << world.rank() << ": received work" << endl;
         reqs[0].cancel();
         return true;
     }
@@ -353,18 +358,17 @@ void slave(mpi::communicator& world) {
 
     while (true) {
         cout << "slave " << world.rank() << ": waiting for work" << endl;
-        vector<u16> node_vector;
-        vector<Sln> sln_vector;
+        WorkData work;
 
-        if (!wait_for_work(world, node_vector, sln_vector)) {
+        if (!wait_for_work(world, work)) {
             break;
         }
 
         // process the batch
         #pragma omp parallel for schedule(dynamic)
-        for (u32 i = 0; i < node_vector.size(); i++) {
-            auto node = node_vector[i];
-            auto sln = sln_vector[i];
+        for (u32 i = 0; i < work.node_ids.size(); i++) {
+            auto node = work.node_ids[i];
+            auto sln = work.configs[i];
             sln.graph = &graph;
             Sln result(sln); // we read the actual result from the optimum
             solve(&result, a, graph, sln, sln, node);
